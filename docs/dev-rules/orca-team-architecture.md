@@ -284,6 +284,8 @@ Worker turn 被 vendor 报终止型 error，但 interrupted-turn auto-resume 仍
 
    共享 DB 多实例还要求 user 行在同一条 SQLite INSERT 中复核 team 仍为 active，并写入精确 `agent_meta.orcaPreVendorCleanup.teamId`。terminal reconciliation 只能 rewind 该标记仍处于 `pre-vendor`（旧行缺 phase 同义）的消息；dispatch lease 在本地 transport 已提交时与释放 writer lock 同事务把 phase 推进为 `submitted`，不能立即删标记，因为 provider 仍可能随后明确拒绝或丢失 acceptance response。明确接受后再清标记，明确拒绝则以第二次短事务 tombstone 精确 `{sessionId, clientId}`，该结算必须重试完整短事务且失败不能静默降级。普通 idempotent retry 遇到 `submitted` 必须按 dispatch-unconfirmed 保留，不能复用旧 row 重派或删除；只有 provider 已权威拒绝上一请求、且 provider adapter 显式声明同一 logical prompt 的 confirmed-rejection retry 时，下一条 writer lease 才能在事务内把该精确 row 暂时恢复为 `pre-vendor` 并发送替代请求，进程崩溃则事务回滚回 `submitted`。确认未提交或发现 team 已终态时仍在原 lease 事务内 tombstone。这样 terminal sweep 等到 lease 后不会误删已提交消息，发送进程在持久化后退出也仍有跨实例恢复依据。
 
+   Codex 的延迟拒绝结算回调只有成功后才能消费，并发调用共享同一次结算。结算失败必须显式报告并保留本会话的待结算记录，后续 send／close 继续重试；不能把数据库失败当作已接管而返回成功。close 仍须先完成原有 provider 关闭，再报告未结清的失败，重复 close 可以重试清理而不能重复关闭 provider。迟到的 lease 结算绑定最初的 owner 和 teardown 信号，等待返回后仍须重新校验；账号退出或切换后拒绝旧回调，不能为它打开新账号数据库。
+
    provider 已提交但受理不明时，保留 worker running／auto-bridge 并结清 provisional dispatch identity，允许后续真实终态正常回报；调用方仍收到 dispatch-unconfirmed，不能声称已确认派发。消息插入与 session 预览／计数失效必须在同一事务完成，tombstone 与预览失效也必须同事务完成；数据库终态后的媒体清理和广播绑定开始时的 DbClient，异步期间切换 owner 后不得在新账号数据库继续清理同名消息。同一捕获的 DbClient 必须贯穿 ingress 等待、cleanup intent、终态扫尾及 duplicate reconciliation，每次 await 返回后、下一个清理副作用前都重新验证身份。
 
    rewind 失败时不得把该行当作已清理：coordinator 必须先保留可写入崩溃快照的 active-turn cleanup recovery，只有 tombstone 成功持久化后才能清掉；后续 drain 或重启恢复必须重试这个 rewind。

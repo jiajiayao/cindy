@@ -52,6 +52,22 @@ describe('OrcaTeamDispatchLeaseCoordinator', () => {
     return client;
   }
 
+  function mockLeaseClient(teamId: string): IsolatedSqliteClient {
+    return {
+      queryOne: vi.fn(async <T = unknown>(sql: string): Promise<T | undefined> => {
+        if (sql.includes('SELECT status FROM orca_teams')) {
+          return { status: 'active' } as T;
+        }
+        if (sql.includes("json_extract(agent_meta, '$.orcaPreVendorCleanup.teamId')")) {
+          return { teamId, phase: 'pre-vendor' } as T;
+        }
+        return { ok: 1 } as T;
+      }) as IsolatedSqliteClient['queryOne'],
+      exec: vi.fn(async () => ({ changes: 1, lastInsertRowid: 0 })),
+      dispose: vi.fn(async () => {}),
+    };
+  }
+
   it('blocks a legacy terminal UPDATE until provider dispatch releases the SQLite lease', async () => {
     const options = await createClientOptions();
     const setup = await trackedClient(options);
@@ -293,6 +309,115 @@ describe('OrcaTeamDispatchLeaseCoordinator', () => {
 
     expect(tombstoneAttempts).toBe(2);
     expect(client.exec).toHaveBeenCalledWith('ROLLBACK');
+  });
+
+  it.each([
+    { outcome: 'accepted', dispose: false, nextOwner: 'owner-2' },
+    { outcome: 'confirmed-undispatched', dispose: false, nextOwner: 'owner-2' },
+    { outcome: 'accepted', dispose: true, nextOwner: 'owner-2' },
+    { outcome: 'confirmed-undispatched', dispose: true, nextOwner: 'owner-2' },
+    { outcome: 'confirmed-undispatched', dispose: true, nextOwner: 'owner-1' },
+  ] as const)(
+    'rejects stale $outcome settlement before opening a DB (dispose=$dispose, next=$nextOwner)',
+    async ({ outcome, dispose, nextOwner }) => {
+      const options = await createClientOptions();
+      let owner = 'owner-1';
+      const client = mockLeaseClient('team-stale');
+      const createClient = vi.fn(async () => client);
+      const coordinator = new OrcaTeamDispatchLeaseCoordinator({
+        resolveScope: () => ({ key: owner, options }),
+        createClient,
+        getTerminalFenceState: () => 'open',
+      });
+      const release = await coordinator.acquire('team-stale', {
+        sessionId: 'session-1',
+        clientId: 'client-stale',
+      });
+      await release('submitted');
+      if (dispose) await coordinator.dispose();
+      owner = nextOwner;
+      vi.mocked(client.exec).mockClear();
+      vi.mocked(client.queryOne).mockClear();
+
+      await expect(release(outcome)).rejects.toMatchObject({
+        code: dispose ? 'ORCA_TEAM_DISPATCH_TEARDOWN' : 'ORCA_TEAM_DISPATCH_OWNER_CHANGED',
+      });
+      expect(createClient).toHaveBeenCalledOnce();
+      expect(client.exec).not.toHaveBeenCalled();
+      expect(client.queryOne).not.toHaveBeenCalled();
+
+      // Rejecting an old callback must leave the coordinator usable by its new owner.
+      const nextRelease = await coordinator.acquire('team-stale');
+      await nextRelease();
+      expect(createClient).toHaveBeenCalledTimes(2);
+      await coordinator.dispose();
+    },
+  );
+
+  it('rechecks teardown after a submitted settlement waits behind another lease', async () => {
+    const options = await createClientOptions();
+    const client = mockLeaseClient('team-queued');
+    const createClient = vi.fn(async () => client);
+    const coordinator = new OrcaTeamDispatchLeaseCoordinator({
+      resolveScope: () => ({ key: 'owner-1', options }),
+      createClient,
+      getTerminalFenceState: () => 'open',
+    });
+    const release = await coordinator.acquire('team-queued', {
+      sessionId: 'session-1',
+      clientId: 'client-queued',
+    });
+    await release('submitted');
+    const releaseBlocker = await coordinator.acquire('team-blocker');
+    vi.mocked(client.exec).mockClear();
+
+    const settlement = release('confirmed-undispatched').catch((error: unknown) => error);
+    const disposing = coordinator.dispose();
+    await releaseBlocker();
+    await expect(settlement).resolves.toMatchObject({ code: 'ORCA_TEAM_DISPATCH_TEARDOWN' });
+    await disposing;
+
+    expect(client.exec).toHaveBeenCalledExactlyOnceWith('ROLLBACK');
+    expect(client.dispose).toHaveBeenCalledOnce();
+    expect(createClient).toHaveBeenCalledOnce();
+  });
+
+  it('rolls back a late settlement if its owner changes while BEGIN is pending', async () => {
+    const options = await createClientOptions();
+    const client = mockLeaseClient('team-begin');
+    const beginStarted = Promise.withResolvers<void>();
+    const beginGate = Promise.withResolvers<void>();
+    let owner = 'owner-1';
+    const createClient = vi.fn(async () => client);
+    const coordinator = new OrcaTeamDispatchLeaseCoordinator({
+      resolveScope: () => ({ key: owner, options }),
+      createClient,
+      getTerminalFenceState: () => 'open',
+    });
+    const release = await coordinator.acquire('team-begin', {
+      sessionId: 'session-1',
+      clientId: 'client-begin',
+    });
+    await release('submitted');
+    vi.mocked(client.exec).mockClear().mockImplementation(async (sql) => {
+      if (sql === 'BEGIN IMMEDIATE') {
+        beginStarted.resolve();
+        await beginGate.promise;
+      }
+      return { changes: 1, lastInsertRowid: 0 };
+    });
+
+    const settlement = release('accepted').catch((error: unknown) => error);
+    await beginStarted.promise;
+    owner = 'owner-2';
+    beginGate.resolve();
+    await expect(settlement).resolves.toMatchObject({ code: 'ORCA_TEAM_DISPATCH_OWNER_CHANGED' });
+
+    expect(client.exec).toHaveBeenCalledTimes(2);
+    expect(client.exec).toHaveBeenNthCalledWith(1, 'BEGIN IMMEDIATE', undefined);
+    expect(client.exec).toHaveBeenNthCalledWith(2, 'ROLLBACK');
+    expect(createClient).toHaveBeenCalledOnce();
+    await coordinator.dispose();
   });
 
   it('retries transient SQLite contention while committing submitted state', async () => {

@@ -55,7 +55,8 @@ export class AppServerRequestTimeoutError extends Error {
 export class AppServerRpcError extends Error {
   readonly code: number;
   readonly data?: unknown;
-  private vendorDispatchRejectionSettlement: (() => Promise<void>) | null = null;
+  private vendorDispatchRejectionSettlement: { settle: () => Promise<void> } | null = null;
+  private vendorDispatchRejectionSettlementInFlight: Promise<boolean> | null = null;
 
   constructor(
     public readonly method: string,
@@ -69,19 +70,35 @@ export class AppServerRpcError extends Error {
 
   /**
    * Keep an authoritative rejection recoverable while the Codex adapter decides
-   * whether it will replace the rejected request. The callback is single-use so
-   * a final error path and a late cleanup path cannot tombstone the same row twice.
+   * whether it will replace the rejected request. Concurrent cleanup paths share
+   * one attempt; a failed attempt retains its callback until settlement succeeds.
    */
   deferVendorDispatchRejectionSettlement(settle: () => Promise<void>): void {
-    this.vendorDispatchRejectionSettlement = settle;
+    this.vendorDispatchRejectionSettlement = { settle };
   }
 
-  async settleVendorDispatchRejection(): Promise<boolean> {
-    const settle = this.vendorDispatchRejectionSettlement;
-    if (!settle) return false;
-    this.vendorDispatchRejectionSettlement = null;
-    await settle();
-    return true;
+  settleVendorDispatchRejection(): Promise<boolean> {
+    if (this.vendorDispatchRejectionSettlementInFlight) {
+      return this.vendorDispatchRejectionSettlementInFlight;
+    }
+    const settlement = this.vendorDispatchRejectionSettlement;
+    if (!settlement) return Promise.resolve(false);
+    const inFlight = Promise.resolve()
+      .then(() => settlement.settle())
+      .then(() => {
+        // A new registration owns a separate debt, even if it reuses the callback.
+        if (this.vendorDispatchRejectionSettlement === settlement) {
+          this.vendorDispatchRejectionSettlement = null;
+        }
+        return true;
+      })
+      .finally(() => {
+        if (this.vendorDispatchRejectionSettlementInFlight === inFlight) {
+          this.vendorDispatchRejectionSettlementInFlight = null;
+        }
+      });
+    this.vendorDispatchRejectionSettlementInFlight = inFlight;
+    return inFlight;
   }
 }
 

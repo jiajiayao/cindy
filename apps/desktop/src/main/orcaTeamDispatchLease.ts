@@ -77,7 +77,7 @@ export class OrcaTeamDispatchLeaseCoordinator {
     let transactionOpen = false;
     try {
       throwIfOrcaDispatchTeardownRequested(teardownSignal, teamId, cleanupTarget);
-      const client = await this.ensureClient();
+      const { scopeKey, value: client } = await this.ensureClient();
       await this.beginImmediate(client);
       transactionOpen = true;
       const row = await client.queryOne<{ status: string }>(
@@ -150,7 +150,13 @@ export class OrcaTeamDispatchLeaseCoordinator {
       return async (outcome: OrcaTeamDispatchLeaseOutcome = 'submitted') => {
         if (released) {
           if (cleanupTarget && outcome !== 'submitted') {
-            await this.settleSubmittedCleanupTarget(teamId, cleanupTarget, outcome);
+            await this.settleSubmittedCleanupTarget(
+              teamId,
+              cleanupTarget,
+              outcome,
+              scopeKey,
+              teardownSignal,
+            );
           }
           return;
         }
@@ -197,7 +203,22 @@ export class OrcaTeamDispatchLeaseCoordinator {
     teamId: string,
     cleanupTarget: OrcaTeamDispatchCleanupTarget,
     outcome: Exclude<OrcaTeamDispatchLeaseOutcome, 'submitted'>,
+    scopeKey: string,
+    teardownSignal: AbortSignal,
   ): Promise<void> {
+    const assertOwner = () => {
+      throwIfOrcaDispatchTeardownRequested(teardownSignal, teamId, cleanupTarget);
+      if (this.deps.resolveScope()?.key !== scopeKey) {
+        throw Object.assign(
+          new Error(`ORCA_TEAM_DISPATCH_OWNER_CHANGED: database owner changed before settlement for team ${teamId}`),
+          { code: 'ORCA_TEAM_DISPATCH_OWNER_CHANGED' },
+        );
+      }
+    };
+    // Provider callbacks may survive close/dispose and be retried much later.
+    // Keep both the original owner and teardown generation, including across
+    // queue waits, so an old callback can never reopen the next owner's DB.
+    assertOwner();
     let unlock!: () => void;
     const previous = this.tail;
     this.tail = new Promise<void>((resolve) => {
@@ -208,23 +229,29 @@ export class OrcaTeamDispatchLeaseCoordinator {
     try {
       let lastError: unknown;
       for (let attempt = 1; attempt <= 3; attempt += 1) {
+        assertOwner();
         let transactionOpen = false;
+        let client: IsolatedSqliteClient | undefined;
         try {
-          const client = await this.ensureClient();
+          ({ value: client } = await this.ensureClient());
+          assertOwner();
           await this.beginImmediate(client);
           transactionOpen = true;
+          assertOwner();
           if (outcome === 'accepted') {
             await this.clearCleanupMarker(client, teamId, cleanupTarget);
           } else {
             await this.tombstoneCleanupTarget(client, teamId, cleanupTarget);
           }
+          assertOwner();
           await this.execWithBusyRetry(client, 'COMMIT');
           return;
         } catch (error) {
           lastError = error;
-          if (transactionOpen && this.client) {
-            await this.releaseTransaction(this.client.value);
+          if (transactionOpen && client) {
+            await this.releaseTransaction(client);
           }
+          assertOwner();
           if (attempt < 3) await delay(attempt * 10);
         }
       }
@@ -262,12 +289,15 @@ export class OrcaTeamDispatchLeaseCoordinator {
     return tracked;
   }
 
-  private async ensureClient(): Promise<IsolatedSqliteClient> {
+  private async ensureClient(): Promise<{
+    scopeKey: string;
+    value: IsolatedSqliteClient;
+  }> {
     const scope = this.deps.resolveScope();
     if (!scope) {
       throw new Error('ORCA_TEAM_DISPATCH_DB_UNAVAILABLE: no active database owner');
     }
-    if (this.client?.scopeKey === scope.key) return this.client.value;
+    if (this.client?.scopeKey === scope.key) return this.client;
     await this.disposeClient();
     const value = await this.deps.createClient(scope.options);
     try {
@@ -277,7 +307,7 @@ export class OrcaTeamDispatchLeaseCoordinator {
       throw error;
     }
     this.client = { scopeKey: scope.key, value };
-    return value;
+    return this.client;
   }
 
   private async beginImmediate(client: IsolatedSqliteClient): Promise<void> {

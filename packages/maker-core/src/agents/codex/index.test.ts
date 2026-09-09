@@ -3766,6 +3766,148 @@ describe('CodexAgent reference directories', () => {
     await handle.close();
   });
 
+  it.each(['initial', 'stale-daemon replacement'] as const)(
+    'retains failed %s rejection cleanup for send and close retries',
+    async (path) => {
+      const agent = new CodexAgent(createDeps());
+      const databaseFailure = new Error('SQLITE_BUSY: tombstone retries exhausted');
+      let cleanupAvailable = false;
+      const rejectionSettlement = vi.fn(async () => {
+        if (!cleanupAvailable) throw databaseFailure;
+      });
+      const rejection = new AppServerRpcError(Method.TurnStart, {
+        code: -32602,
+        message: 'invalid model',
+      });
+      rejection.deferVendorDispatchRejectionSettlement(rejectionSettlement);
+      const originalSettlement = vi.fn(async () => {});
+      const staleRejection = new AppServerRpcError(Method.TurnStart, {
+        code: -32000,
+        message: 'thread not found',
+      });
+      staleRejection.deferVendorDispatchRejectionSettlement(originalSettlement);
+      let turnStarts = 0;
+      const host = installFakeHost(agent, (method) => {
+        if (method !== Method.TurnStart) return undefined;
+        if (++turnStarts === 1 && path === 'stale-daemon replacement') throw staleRejection;
+        throw rejection;
+      });
+      const handle = await agent.startSession({
+        sessionId: 'session-failed-rejection-cleanup',
+        model: 'gpt-5.4',
+        workingDir: '/repo',
+      });
+      try {
+        const sending = handle.send(
+          { type: 'user', content: 'rejected request' },
+          { acquireVendorDispatchLease: async () => vi.fn() },
+        );
+        await expect(sending).rejects.toMatchObject({
+          name: 'CodexDispatchRejectionCleanupError',
+          code: 'CODEX_DISPATCH_REJECTION_CLEANUP_FAILED',
+          cause: databaseFailure,
+          rejection,
+        });
+        expect(rejectionSettlement).toHaveBeenCalledTimes(1);
+        expect(originalSettlement).not.toHaveBeenCalled();
+        expect(handle.isTurnRunning?.()).toBe(false);
+        const previousTurnStarts = turnStarts;
+        await expect(handle.send({ type: 'user', content: 'must wait for cleanup' }))
+          .rejects.toMatchObject({ code: 'CODEX_DISPATCH_REJECTION_CLEANUP_FAILED' });
+        expect(turnStarts).toBe(previousTurnStarts);
+        expect(rejectionSettlement).toHaveBeenCalledTimes(2);
+
+        await expect(handle.close()).rejects.toMatchObject({
+          code: 'CODEX_DISPATCH_REJECTION_CLEANUP_FAILED',
+        });
+        expect(host.subscribeThread.mock.results[0]?.value.release).toHaveBeenCalledOnce();
+        expect(rejectionSettlement).toHaveBeenCalledTimes(3);
+        cleanupAvailable = true;
+        await handle.close();
+        expect(rejectionSettlement).toHaveBeenCalledTimes(4);
+        await handle.close();
+        expect(rejectionSettlement).toHaveBeenCalledTimes(4);
+      } finally {
+        cleanupAvailable = true;
+        await handle.close();
+      }
+    },
+  );
+
+  it.each([
+    ['overload', 'active'], ['overload', 'aborted'], ['overload', 'closed'],
+    ['HTTP recovery', 'active'], ['HTTP recovery', 'aborted'], ['HTTP recovery', 'closed'],
+  ] as const)('retains %s rejection cleanup when the retry is %s', async (retryKind, lifecycle) => {
+    vi.useFakeTimers();
+    let cleanupAvailable = false;
+    let handle: AgentSessionHandle | undefined;
+    try {
+      const agent = new CodexAgent(createDeps({}, retryKind === 'HTTP recovery'
+        ? { armCodexHttpRecovery: vi.fn(() => 'encrypted_content') }
+        : {}));
+      const retryStart = deferred<unknown>();
+      let turnStarts = 0;
+      const host = installFakeHost(agent, (method) => {
+        if (method !== Method.TurnStart) return undefined;
+        return ++turnStarts === 1 ? { turn: { id: 'turn-1' } } : retryStart.promise;
+      });
+      handle = await agent.startSession({
+        sessionId: 'session-background-rejection-cleanup', model: 'gpt-5.4', workingDir: '/repo',
+      });
+      const events: AgentEvent[] = [];
+      void (async () => { for await (const event of handle!.events()) events.push(event); })();
+      await handle.send({ type: 'user', content: 'retry then fail cleanup' });
+      const handlers = host.getThreadHandlers()!;
+      const recoveryMessage = 'Encrypted content could not be decrypted or parsed. code=invalid_encrypted_content';
+      handlers.error!({
+        threadId: 'start-thread-id', turnId: 'turn-1', willRetry: false,
+        error: retryKind === 'overload'
+          ? { message: 'Selected model is at capacity. Please try a different model.' }
+          : { message: 'Bad request', additionalDetails: recoveryMessage, codexErrorInfo: 'badRequest' },
+      });
+      if (retryKind === 'HTTP recovery') {
+        handlers.turnCompleted!({
+          threadId: 'start-thread-id',
+          turn: { id: 'turn-1', status: 'failed', error: { message: recoveryMessage } },
+        });
+      }
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(turnStarts).toBe(2);
+      if (lifecycle === 'aborted') await handle.abort();
+      if (lifecycle === 'closed') await handle.close();
+      await vi.advanceTimersByTimeAsync(0);
+      const terminalCount = () => events.filter((event) => event.type === 'error' && event.data.isTerminal).length;
+      const beforeRejection = terminalCount();
+      const rejection = new AppServerRpcError(Method.TurnStart, { code: -32602, message: 'invalid model' });
+      const rejectionSettlement = vi.fn(async () => {
+        if (!cleanupAvailable) throw new Error('tombstone unavailable');
+      });
+      rejection.deferVendorDispatchRejectionSettlement(rejectionSettlement);
+      retryStart.reject(rejection);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(rejectionSettlement).toHaveBeenCalledOnce();
+      expect(handle.isTurnRunning?.()).toBe(false);
+      if (lifecycle === 'active') {
+        expect(events.some((event) => event.type === 'error'
+          && event.data.isTerminal && event.data.message.includes('rejected turn cleanup failed'))).toBe(true);
+      } else {
+        expect(terminalCount()).toBe(beforeRejection);
+      }
+      await expect(handle.close()).rejects.toMatchObject({
+        code: 'CODEX_DISPATCH_REJECTION_CLEANUP_FAILED',
+      });
+      expect(rejectionSettlement).toHaveBeenCalledTimes(2);
+      expect(host.subscribeThread.mock.results.at(-1)?.value.release).toHaveBeenCalledOnce();
+      cleanupAvailable = true;
+      await handle.close();
+      expect(rejectionSettlement).toHaveBeenCalledTimes(3);
+    } finally {
+      cleanupAvailable = true;
+      await handle?.close();
+      vi.useRealTimers();
+    }
+  });
+
   it('accepts lower usage totals after stale-daemon resume starts a new execution generation', async () => {
     const agent = new CodexAgent(createDeps());
     let turnStartCount = 0;
