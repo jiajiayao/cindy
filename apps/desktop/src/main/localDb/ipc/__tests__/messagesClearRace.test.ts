@@ -1,5 +1,7 @@
+import { readFileSync } from 'node:fs';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { transpileModule, ScriptTarget } from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { messages, sessions } from '../../schema';
@@ -11,6 +13,7 @@ const h = vi.hoisted(() => ({
   sqlite: null as Database.Database | null,
   client: null as unknown as DbClient,
   broadcast: vi.fn(),
+  warn: vi.fn(),
   raceOnInsert: false,
   endOrcaTeamOnInsert: false,
 }));
@@ -20,10 +23,10 @@ vi.mock('electron', () => ({
   BrowserWindow: { getAllWindows: () => [] },
 }));
 vi.mock('../../../logger', () => ({
-  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: h.warn, error: vi.fn() }),
 }));
 vi.mock('../../../logger.js', () => ({
-  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: h.warn, error: vi.fn() }),
 }));
 vi.mock('../../../maker-host/codex-local-sessions', () => ({
   importExternalCodexMessagesForSession: vi.fn(async () => undefined),
@@ -64,6 +67,66 @@ import {
   rewindOrcaPreVendorCleanupRows,
   rewindPersistedUserMessageAfterClear,
 } from '../messages';
+
+// Exercise the real terminal/disable closure while retaining the real finalizer
+// and SQLite-backed message reads. Runtime-only host actions are observable stubs.
+const registerSource = readFileSync(
+  new URL('../../../maker-ipc/register.ts', import.meta.url), 'utf8',
+).replace(/\r\n/g, '\n');
+const cleanupStart = registerSource.indexOf('  type OrcaTeamCleanupScope =');
+const cleanupEnd = registerSource.indexOf('  function enableOrcaWithLeadLifecycleLock(', cleanupStart);
+expect(cleanupStart).toBeGreaterThanOrEqual(0);
+expect(cleanupEnd).toBeGreaterThan(cleanupStart);
+const disableCleanupJs = transpileModule(
+  `${registerSource.slice(cleanupStart, cleanupEnd)}\nreturn disableOrcaInternal;`,
+  { compilerOptions: { target: ScriptTarget.ES2022 } },
+).outputText;
+
+function postCommitDisableHarness(sqlite: Database.Database, onCommitted: () => void) {
+  const abort = vi.fn(async () => undefined);
+  const close = vi.fn(async () => undefined);
+  const archive = vi.fn(async () => ['worker-1']);
+  const clearLead = vi.fn(async () => undefined);
+  const discard = vi.fn(async () => undefined);
+  const deps = {
+    getDbClient: () => h.client,
+    getActiveTeamByLead: async () => ({ id: 'team-1' }),
+    listWorkersByLead: async () => [{ teamId: 'team-1', sessionId: 'worker-1' }],
+    markTeamEnded: async (_teamId: string, _status: string, hooks: {
+      beforeTerminalCommit(): Promise<void>;
+    }) => {
+      await hooks.beforeTerminalCommit();
+      sqlite.exec("UPDATE orca_teams SET status = 'completed' WHERE id = 'team-1'");
+      sqlite.exec("UPDATE messages SET rewind_at = 200 WHERE client_id = 'postcommit'");
+      onCommitted();
+      return [{ sessionId: 's1', clientId: 'postcommit' }];
+    },
+    finalizeRewoundOrcaPreVendorCleanupRows,
+    rewindOrcaPreVendorCleanupRows: async () => [],
+    inputCoordinator: {
+      discardQueuedItemsWhere: discard,
+      persistOrcaCleanupIntentWhere: async () => undefined,
+    },
+    resolveOrcaQueueItemTeamId: () => 'team-1',
+    persistedOrcaPreVendorInputsForTeam: () => new Map(),
+    orcaInterAgentDispatcher: { waitForTeamDispatchSettlements: async () => undefined },
+    orcaTeamService: { clearAutoBridgeState: vi.fn() },
+    cancelIOSSimulatorSessionOperations: async () => undefined,
+    maker: { getSession: () => ({ isTurnRunning: () => true, abort }), closeSession: close },
+    cleanupPendingInteractionsForSession: vi.fn(),
+    forgetKnownOrcaWorkerSession: vi.fn(),
+    markWorkersStatusByTeam: async () => undefined,
+    captureSessionRecycleScope: vi.fn(),
+    archiveWorkersByTeam: archive,
+    recycleSessionWorktreeForStatusChange: async () => undefined,
+    clearLeadOrcaRoleState: clearLead,
+    log: { info: vi.fn(), warn: h.warn },
+  };
+  const run = new Function(...Object.keys(deps), disableCleanupJs)(...Object.values(deps)) as (
+    leadSessionId: string,
+  ) => Promise<{ ok: true }>;
+  return { run, abort, close, archive, clearLead, discard };
+}
 
 function createDb(): Database.Database {
   const sqlite = new Database(':memory:');
@@ -331,6 +394,65 @@ describe('message persistence clear boundary', () => {
     expect(removeSessionAttachmentRefIfUnreferencedByLiveMessage).toHaveBeenCalledWith(
       { sessionId: 's1', hash }, h.db,
     );
+  });
+
+  it.each(['transient', 'persistent'] as const)(
+    'finishes disabling Orca after a %s post-commit row-query failure',
+    async (failure) => {
+      sqlite.prepare("INSERT INTO orca_teams (id, status) VALUES ('team-1', 'active')").run();
+      sqlite.prepare(
+        "INSERT INTO messages (id, client_id, session_id, role, content, created_at) VALUES ('postcommit-row', 'postcommit', 's1', 'user', 'queued', 100)",
+      ).run();
+      const queryError = new Error('post-commit row query failed');
+      const select = vi.spyOn(h.client.drizzle, 'select');
+      const disable = postCommitDisableHarness(sqlite, () => {
+        if (failure === 'transient') select.mockImplementationOnce(() => { throw queryError; });
+        else select.mockImplementation(() => { throw queryError; });
+      });
+
+      await expect(disable.run('lead-1')).resolves.toEqual({ ok: true });
+
+      expect(sqlite.prepare("SELECT status FROM orca_teams WHERE id = 'team-1'").get())
+        .toEqual({ status: 'completed' });
+      expect(sqlite.prepare("SELECT rewind_at FROM messages WHERE client_id = 'postcommit'").get())
+        .toEqual({ rewind_at: 200 });
+      expect(select).toHaveBeenCalledTimes(failure === 'transient' ? 2 : 3);
+      expect(disable.discard).toHaveBeenCalledTimes(2);
+      expect(disable.abort).toHaveBeenCalledOnce();
+      expect(disable.close).toHaveBeenCalledWith('worker-1');
+      expect(disable.archive).toHaveBeenCalledWith('team-1');
+      expect(disable.clearLead).toHaveBeenCalledWith('lead-1');
+      if (failure === 'persistent') {
+        expect(h.warn).toHaveBeenCalledWith('post-commit Orca row finalization failed', {
+          sessionId: 's1', clientId: 'postcommit', attempts: 3, error: queryError.message,
+        });
+      } else {
+        expect(h.broadcast).toHaveBeenCalled();
+        expect(h.warn).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it('stops terminal cleanup if owner changes during a failed post-commit row query', async () => {
+    sqlite.prepare("INSERT INTO orca_teams (id, status) VALUES ('team-1', 'active')").run();
+    const select = vi.spyOn(h.client.drizzle, 'select');
+    const disable = postCommitDisableHarness(sqlite, () => {
+      select.mockImplementationOnce(() => {
+        h.client = { ...h.client, tx: vi.fn() };
+        throw new Error('old database connection closed');
+      });
+    });
+
+    await expect(disable.run('lead-1')).rejects.toThrow('ORCA_CLEANUP_OWNER_CHANGED');
+
+    expect(select).toHaveBeenCalledOnce();
+    expect(h.client.tx).not.toHaveBeenCalled();
+    expect(disable.discard).not.toHaveBeenCalled();
+    expect(disable.abort).not.toHaveBeenCalled();
+    expect(disable.close).not.toHaveBeenCalled();
+    expect(disable.archive).not.toHaveBeenCalled();
+    expect(disable.clearLead).not.toHaveBeenCalled();
+    expect(h.broadcast).not.toHaveBeenCalled();
   });
 
   it('does not apply an old cleanup receipt to matching IDs in the next owner database', async () => {

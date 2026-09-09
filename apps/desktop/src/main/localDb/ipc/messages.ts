@@ -6,6 +6,7 @@
  * - `updateContent(sessionId, clientId, content)` —— 用于 ask_user 的 answered 状态等
  */
 
+import { setTimeout as delay } from 'node:timers/promises';
 import { ipcMain, BrowserWindow } from 'electron';
 import {
   and,
@@ -1338,20 +1339,43 @@ export async function rewindPersistedUserMessageAfterClear(
   return true;
 }
 
-/** Complete media cleanup and UI broadcast for rows already rewound by a DB transaction. */
+/** Complete media cleanup and UI broadcast without undoing durable terminal success. */
 export async function finalizeRewoundOrcaPreVendorCleanupRows(
   rows: Array<{ sessionId: string; clientId: string }>,
   expectedDbClient: DbClient = getDbClient(),
 ): Promise<void> {
   if (!isDbClientCurrent(expectedDbClient)) return;
-  await Promise.all(
-    rows.map(({ sessionId, clientId }) =>
-      rewindPersistedUserMessageAfterClear(sessionId, clientId, {
-        finalizeAlreadyRewound: true,
-        expectedDbClient,
-      }),
-    ),
+  const maxAttempts = 3;
+  const results = await Promise.allSettled(
+    rows.map(async ({ sessionId, clientId }) => {
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        if (!isDbClientCurrent(expectedDbClient)) return;
+        try {
+          await rewindPersistedUserMessageAfterClear(sessionId, clientId, {
+            finalizeAlreadyRewound: true,
+            expectedDbClient,
+          });
+          return;
+        } catch (error) {
+          if (!isDbClientCurrent(expectedDbClient)) return;
+          if (attempt === maxAttempts) throw error;
+          await delay(attempt * 10);
+        }
+      }
+    }),
   );
+  if (!isDbClientCurrent(expectedDbClient)) return;
+  // The row is already durably rewound. Exhausted media/UI finalization must
+  // not skip queue settlement, worker shutdown or Lead role cleanup. Report
+  // the exact failed receipt after every row has finished its bounded retries.
+  for (const [index, result] of results.entries()) {
+    if (result.status === 'fulfilled') continue;
+    log.warn('post-commit Orca row finalization failed', {
+      ...rows[index],
+      attempts: maxAttempts,
+      error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+    });
+  }
 }
 
 /** Conditionally rewind only explicit, still-pre-vendor Orca cleanup markers. */

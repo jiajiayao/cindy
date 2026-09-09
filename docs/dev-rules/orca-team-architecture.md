@@ -288,6 +288,8 @@ Worker turn 被 vendor 报终止型 error，但 interrupted-turn auto-resume 仍
 
    provider 已提交但受理不明时，保留 worker running／auto-bridge 并结清 provisional dispatch identity，允许后续真实终态正常回报；调用方仍收到 dispatch-unconfirmed，不能声称已确认派发。消息插入与 session 预览／计数失效必须在同一事务完成，tombstone 与预览失效也必须同事务完成；数据库终态后的媒体清理和广播绑定开始时的 DbClient，异步期间切换 owner 后不得在新账号数据库继续清理同名消息。同一捕获的 DbClient 必须贯穿 ingress 等待、cleanup intent、终态扫尾及 duplicate reconciliation，每次 await 返回后、下一个清理副作用前都重新验证身份。
 
+   tombstone 已提交后的媒体／UI finalization 必须逐行有界重试，并等待所有行结算；耗尽后记录精确 sessionId/clientId 和错误，继续队列、Worker 关闭与 Lead 身份清理，不能把局部后处理失败当成终态提交失败。重试与继续清理仍绑定捕获的 DbClient，owner 改变时立即停止。
+
    rewind 失败时不得把该行当作已清理：coordinator 必须先保留可写入崩溃快照的 active-turn cleanup recovery，只有 tombstone 成功持久化后才能清掉；后续 drain 或重启恢复必须重试这个 rewind。
 
 #### Worker 运行态
