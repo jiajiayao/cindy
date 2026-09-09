@@ -1,13 +1,15 @@
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { messages, sessions } from '../../schema';
+import type { DbClient } from '../../client/DbClient';
+import { tx as runInprocTx } from '../../worker/opHandlers/tx';
 
 const h = vi.hoisted(() => ({
   db: null as ReturnType<typeof drizzle> | null,
   sqlite: null as Database.Database | null,
-  client: null as any,
+  client: null as unknown as DbClient,
   broadcast: vi.fn(),
   raceOnInsert: false,
   endOrcaTeamOnInsert: false,
@@ -58,6 +60,7 @@ vi.mock('../../client/current', () => ({
 
 import {
   createMessage,
+  finalizeRewoundOrcaPreVendorCleanupRows,
   rewindOrcaPreVendorCleanupRows,
   rewindPersistedUserMessageAfterClear,
 } from '../messages';
@@ -68,6 +71,9 @@ function createDb(): Database.Database {
     CREATE TABLE sessions (
       id TEXT PRIMARY KEY,
       cleared_at INTEGER,
+      list_preview TEXT,
+      list_preview_role TEXT,
+      list_message_count INTEGER,
       status TEXT NOT NULL DEFAULT 'active'
     );
     CREATE TABLE messages (
@@ -91,22 +97,24 @@ function createDb(): Database.Database {
   h.db = db;
   h.client = {
     drizzle: db,
-    exec: vi.fn(async (sql: string, params: unknown[] = []) => {
+    tx: vi.fn(async (name: string, args: unknown) => {
       // Model /clear winning between the preflight SELECT and the guarded
       // INSERT. The single SQL statement must then insert zero rows.
-      if (h.raceOnInsert && sql.startsWith('INSERT INTO messages')) {
+      if (h.raceOnInsert && name === 'message.insert') {
         sqlite.prepare('UPDATE sessions SET cleared_at = ? WHERE id = ?').run(200, 's1');
       }
-      if (h.endOrcaTeamOnInsert && sql.startsWith('INSERT INTO messages')) {
+      if (h.endOrcaTeamOnInsert && name === 'message.insert') {
         sqlite.prepare("UPDATE orca_teams SET status = 'completed' WHERE id = ?").run('team-1');
       }
-      return sqlite.prepare(sql).run(...params);
+      return runInprocTx(sqlite, { name, args });
     }),
+    exec: vi.fn(async (sql: string, params: unknown[] = []) =>
+      sqlite.prepare(sql).run(...params)),
     query: vi.fn(async (sql: string, params: unknown[] = []) =>
       sqlite.prepare(sql).all(...params)),
     queryOne: vi.fn(async (sql: string, params: unknown[] = []) =>
       sqlite.prepare(sql).get(...params)),
-  };
+  } as unknown as DbClient;
   return sqlite;
 }
 
@@ -118,6 +126,37 @@ describe('message persistence clear boundary', () => {
     h.raceOnInsert = false;
     h.endOrcaTeamOnInsert = false;
     sqlite = createDb();
+  });
+
+  afterEach(() => sqlite.close());
+
+  it('invalidates the list projection only when an Orca insert succeeds', async () => {
+    sqlite.prepare("INSERT INTO orca_teams (id, status) VALUES (?, 'active')").run('team-1');
+    const cachePreview = () => sqlite.prepare(
+      "UPDATE sessions SET list_preview = 'cached', list_preview_role = 'user', list_message_count = 1 WHERE id = 's1'",
+    ).run();
+    const readProjection = () => sqlite.prepare(
+      "SELECT list_preview, list_preview_role, list_message_count FROM sessions WHERE id = 's1'",
+    ).get();
+    cachePreview();
+    await createMessage('s1', {
+      clientId: 'orca-projection', role: 'user', content: 'first',
+      agentMeta: { orcaPreVendorCleanup: { teamId: 'team-1' } },
+    }, { expectedOrcaTeamId: 'team-1', expectedClearBoundaryMs: null });
+    expect(readProjection()).toEqual({
+      list_preview: null, list_preview_role: null, list_message_count: null,
+    });
+
+    cachePreview();
+    h.endOrcaTeamOnInsert = true;
+    await expect(createMessage('s1', {
+      clientId: 'orca-projection-rejected', role: 'user', content: 'late',
+      agentMeta: { orcaPreVendorCleanup: { teamId: 'team-1' } },
+    }, { expectedOrcaTeamId: 'team-1', expectedClearBoundaryMs: null }))
+      .rejects.toThrow('ORCA_TEAM_INACTIVE');
+    expect(readProjection()).toEqual({
+      list_preview: 'cached', list_preview_role: 'user', list_message_count: 1,
+    });
   });
 
   it('atomically rejects an Orca row when another instance ends the team', async () => {
@@ -289,9 +328,74 @@ describe('message persistence clear boundary', () => {
 
     await rewindPersistedUserMessageAfterClear('s1', 'client-media');
 
-    expect(removeSessionAttachmentRefIfUnreferencedByLiveMessage).toHaveBeenCalledWith({
-      sessionId: 's1',
-      hash,
+    expect(removeSessionAttachmentRefIfUnreferencedByLiveMessage).toHaveBeenCalledWith(
+      { sessionId: 's1', hash }, h.db,
+    );
+  });
+
+  it('does not apply an old cleanup receipt to matching IDs in the next owner database', async () => {
+    const previousClient = h.client;
+    const nextOwnerDb = createDb();
+    try {
+      nextOwnerDb.prepare(
+        "INSERT INTO messages (id, client_id, session_id, role, content, created_at) VALUES ('shared-id', 'shared-client', 's1', 'user', 'next owner', 1)",
+      ).run();
+      await finalizeRewoundOrcaPreVendorCleanupRows([
+        { sessionId: 's1', clientId: 'shared-client' },
+      ], previousClient);
+      expect(nextOwnerDb.prepare(
+        "SELECT rewind_at FROM messages WHERE client_id = 'shared-client'",
+      ).get()).toEqual({ rewind_at: null });
+      expect(h.broadcast).not.toHaveBeenCalled();
+      const { removeRefs } = await import('../../../cindy-media/ledger');
+      expect(removeRefs).not.toHaveBeenCalled();
+    } finally {
+      nextOwnerDb.close();
+    }
+  });
+
+  it('stops finalizing a durable recovery sweep when its database owner changes', async () => {
+    sqlite.prepare(
+      "INSERT INTO messages (id, client_id, session_id, role, content, agent_meta, created_at) VALUES ('pending', 'pending', 's1', 'user', 'pending', ?, 1)",
+    ).run(JSON.stringify({ orcaPreVendorCleanup: { teamId: 'team-1' } }));
+    vi.mocked(h.client.tx).mockImplementationOnce((async (name: string, args: unknown) => {
+      const result = runInprocTx(sqlite, { name, args });
+      h.client = { ...h.client };
+      return result;
+    }) as DbClient['tx']);
+    await expect(rewindOrcaPreVendorCleanupRows('team-1', ['s1'])).resolves.toEqual([
+      { sessionId: 's1', clientId: 'pending' },
+    ]);
+    const { removeRefs } = await import('../../../cindy-media/ledger');
+    expect(removeRefs).not.toHaveBeenCalled();
+    expect(h.broadcast).not.toHaveBeenCalled();
+  });
+
+  it('rejects a stale recovery scope before issuing any transaction', async () => {
+    const previousClient = h.client;
+    h.client = { ...h.client, tx: vi.fn() };
+    await expect(rewindOrcaPreVendorCleanupRows('team-1', ['s1'], previousClient))
+      .rejects.toThrow('ORCA_CLEANUP_OWNER_CHANGED');
+    expect(previousClient.tx).not.toHaveBeenCalled();
+    expect(h.client.tx).not.toHaveBeenCalled();
+    expect(h.broadcast).not.toHaveBeenCalled();
+  });
+
+  it('pins media cleanup to the original database and stops after an owner change', async () => {
+    sqlite.prepare(
+      "INSERT INTO messages (id, client_id, session_id, role, content, created_at) VALUES ('pending', 'pending', 's1', 'user', 'pending', 1)",
+    ).run();
+    const originalDb = h.db;
+    const { removeRefs, removeSessionAttachmentRefIfUnreferencedByLiveMessage } = await import(
+      '../../../cindy-media/ledger',
+    );
+    vi.mocked(removeRefs).mockImplementationOnce(async () => {
+      h.client = { ...h.client };
+      return 1;
     });
+    await rewindPersistedUserMessageAfterClear('s1', 'pending');
+    expect(removeRefs).toHaveBeenCalledWith({ refKind: 'message', refId: 'pending' }, originalDb);
+    expect(removeSessionAttachmentRefIfUnreferencedByLiveMessage).not.toHaveBeenCalled();
+    expect(h.broadcast).not.toHaveBeenCalled();
   });
 });

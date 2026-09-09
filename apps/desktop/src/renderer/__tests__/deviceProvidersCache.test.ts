@@ -84,7 +84,7 @@ describe('useDeviceProviders deviceId-aware cache', () => {
     expect(mod.getCachedDeviceProviders('dev-invalid')).toBeNull();
   });
 
-  it('provider 数组混入非法元素时整份进入 error，不得部分发布或落缓存', async () => {
+  it('provider 数组混入非法元素时丢掉坏项，保留合法供应商', async () => {
     const invoke = vi.fn(async () => ({ providers: [provider('valid'), null] }));
     vi.stubGlobal('window', { electronAPI: { deviceLink: { invoke } } });
     const mod = await import('@/hooks/useDeviceProviders');
@@ -93,12 +93,15 @@ describe('useDeviceProviders deviceId-aware cache', () => {
 
     await mod.prefetchDeviceProviders('dev-invalid-item');
 
-    expect(listener).toHaveBeenCalledWith({
-      status: 'error',
-      error: 'Invalid provider list response',
-      unsupported: false,
-    });
-    expect(mod.getCachedDeviceProviders('dev-invalid-item')).toBeNull();
+    expect(mod.getCachedDeviceProviders('dev-invalid-item')?.providers.map((row) => row.id)).toEqual([
+      'valid',
+    ]);
+    expect(listener).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'ready',
+        providers: [expect.objectContaining({ id: 'valid' })],
+      }),
+    );
   });
 
   it('接受不含执行字段的安全投影 provider', async () => {
@@ -185,7 +188,7 @@ describe('useDeviceProviders deviceId-aware cache', () => {
     ]);
   });
 
-  it('模型有 efforts 却没有自洽 defaultEffort 时丢掉该行，不整表失败', async () => {
+  it('缺默认思考深度的远程模型保留，并按实际支持档位补默认', async () => {
     const invoke = vi.fn(async () => ({
       providers: [
         {
@@ -217,7 +220,24 @@ describe('useDeviceProviders deviceId-aware cache', () => {
 
     expect(
       mod.getCachedDeviceProviders('dev-luna')?.providers[0]?.models['claude-code']?.map((m) => m.id),
-    ).toEqual(['claude-opus-5']);
+    ).toEqual(['gpt-5.6-luna', 'claude-opus-5']);
+    expect(mod.getCachedDeviceProviders('dev-luna')?.providers[0]?.models['claude-code']?.[0]?.defaultEffort).toBe('medium');
+  });
+
+  it('preserves explicit no-thinking and rejects malformed remote defaults', async () => {
+    const mod = await import('@/hooks/useDeviceProviders');
+    const base = providerWithModel('remote');
+    const model = base.models['claude-code'][0];
+    const result = mod.parseDeviceProvidersPayload({ providers: [{ ...base, models: {
+      'claude-code': [
+        { ...model, id: 'empty', efforts: [], defaultEffort: undefined },
+        { ...model, id: 'explicit-null', defaultEffort: null },
+        { ...model, id: 'invalid', defaultEffort: { value: 'medium' } },
+      ],
+    } }] });
+    expect(result.providers[0]?.models['claude-code']?.map(m => [m.id, m.defaultEffort])).toEqual([
+      ['empty', null], ['explicit-null', null],
+    ]);
   });
 
   it.each([

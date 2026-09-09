@@ -101,7 +101,7 @@ describe('disableOrcaInternal stranded-lead recovery', () => {
       helperAt,
     );
     const durableSweepAt = registerSource.indexOf(
-      'await rewindOrcaPreVendorCleanupRows(input.teamId, input.sessionIds)',
+      'await rewindOrcaPreVendorCleanupRows(input.teamId, input.sessionIds, input.expectedDbClient)',
       helperAt,
     );
     const terminalHelperAt = registerSource.indexOf(
@@ -112,11 +112,11 @@ describe('disableOrcaInternal stranded-lead recovery', () => {
       terminalHelperAt,
     );
     const preparedAt = registerSource.indexOf(
-      'beforeTerminalCommit: () => prepareOrcaTeamTerminalCommit(cleanupScope)',
+      'beforeTerminalCommit: async () => {',
       endedAt,
     );
     const rollbackAt = registerSource.indexOf(
-      'onTerminalCommitFailed: () => settleOrcaTeamQueuedInputs(cleanupScope)',
+      'onTerminalCommitFailed: () => {',
       endedAt,
     );
     const atomicSweepAt = registerSource.indexOf(
@@ -124,7 +124,7 @@ describe('disableOrcaInternal stranded-lead recovery', () => {
       endedAt,
     );
     const finalizedAt = registerSource.indexOf(
-      'await finalizeRewoundOrcaPreVendorCleanupRows(atomicallyRewoundRows)',
+      'await finalizeRewoundOrcaPreVendorCleanupRows(atomicallyRewoundRows, cleanupDbClient)',
       endedAt,
     );
     const settledAt = registerSource.indexOf(
@@ -147,6 +147,18 @@ describe('disableOrcaInternal stranded-lead recovery', () => {
     expect(helperPreparedAt).toBeGreaterThan(durableSweepAt);
     expect(endedAt).toBeGreaterThan(-1);
     expect(preparedAt).toBeGreaterThan(endedAt);
+    const terminalSource = registerSource.slice(terminalHelperAt, settledAt);
+    expect(terminalSource).toContain('const cleanupDbClient = getDbClient();');
+    expect(terminalSource).toContain('if (getDbClient() !== cleanupDbClient) {');
+    expect(terminalSource).toMatch(
+      /beforeTerminalCommit: async \(\) => \{\s*assertCleanupOwnerCurrent\(\);\s*await prepareOrcaTeamTerminalCommit\(cleanupScope\);\s*assertCleanupOwnerCurrent\(\);/,
+    );
+    expect(terminalSource).toMatch(
+      /onTerminalCommitFailed: \(\) => \{\s*assertCleanupOwnerCurrent\(\);\s*return settleOrcaTeamQueuedInputs\(cleanupScope\);/,
+    );
+    expect(terminalSource).toMatch(
+      /await finalizeRewoundOrcaPreVendorCleanupRows\(atomicallyRewoundRows, cleanupDbClient\);\s*assertCleanupOwnerCurrent\(\);/,
+    );
     expect(atomicSweepAt).toBeGreaterThan(preparedAt);
     expect(rollbackAt).toBeGreaterThan(atomicSweepAt);
     expect(finalizedAt).toBeGreaterThan(rollbackAt);

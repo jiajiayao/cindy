@@ -308,7 +308,7 @@ export class OrcaTeamDispatchLeaseCoordinator {
     teamId: string,
     cleanupTarget: OrcaTeamDispatchCleanupTarget,
   ): Promise<void> {
-    await this.execWithBusyRetry(
+    const updated = await this.execWithBusyRetry(
       client,
       `UPDATE messages
           SET rewind_at = ?
@@ -319,6 +319,13 @@ export class OrcaTeamDispatchLeaseCoordinator {
           AND json_extract(agent_meta, '$.orcaPreVendorCleanup.teamId') = ?`,
       [Date.now(), cleanupTarget.sessionId, cleanupTarget.clientId, teamId],
     );
+    if (updated.changes > 0) {
+      await this.execWithBusyRetry(
+        client,
+        'UPDATE sessions SET list_preview = NULL, list_preview_role = NULL WHERE id = ?',
+        [cleanupTarget.sessionId],
+      );
+    }
   }
 
   private async persistSubmittedCleanupTargetUnderLease(

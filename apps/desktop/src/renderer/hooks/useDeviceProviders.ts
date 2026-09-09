@@ -15,6 +15,7 @@ import { useEffect, useState } from 'react';
 
 import { CONTROLLER_CAPABILITY_PROVIDER_LOGO_KINDS_V2 } from '@cindy/device-link';
 import type { ProviderView } from '@cindy/model-providers';
+import { defaultEffortForCapabilities } from '@cindy/model-providers';
 
 import { createLogger } from '@/lib/logger';
 import { extractIpcError } from '@/utils/ipcError';
@@ -81,7 +82,7 @@ function isProviderModel(value: unknown): boolean {
     value.contextWindow > 0 &&
     Array.isArray(efforts) &&
     efforts.every((effort) => typeof effort === 'string') &&
-    (defaultEffort === null ||
+    (defaultEffort === undefined || defaultEffort === null ||
       (typeof defaultEffort === 'string' && efforts.includes(defaultEffort))) &&
     isOptionalBoolean(value.disabled) &&
     isOptionalBoolean(value.supportsFastMode) &&
@@ -104,7 +105,11 @@ function sanitizeProviderModels(
   const sanitized: Record<string, unknown[]> = {};
   for (const [agent, entries] of Object.entries(models)) {
     if (!Array.isArray(entries)) return null;
-    sanitized[agent] = entries.filter(isProviderModel);
+    sanitized[agent] = entries.filter(isProviderModel).map((entry: Record<string, unknown>) =>
+      entry.defaultEffort === undefined
+        ? { ...entry, defaultEffort: defaultEffortForCapabilities(entry.efforts as string[]) }
+        : entry,
+    );
   }
   return sanitized;
 }
@@ -132,10 +137,14 @@ export function parseDeviceProvidersPayload(value: unknown): DeviceProvidersPayl
   if (!isRecord(value)) {
     throw new Error('Invalid provider list response');
   }
-  if (!Array.isArray(value.providers) || !value.providers.every(isProviderView)) {
+  if (!Array.isArray(value.providers)) {
     throw new Error('Invalid provider list response');
   }
-  const providersIn = value.providers;
+  const rawProviders = value.providers;
+  const providersIn = rawProviders.filter(isProviderView);
+  if (providersIn.length === 0 && rawProviders.length > 0) {
+    throw new Error('Invalid provider list response');
+  }
   const overrides = value.modelVisibilityOverrides;
   if (
     overrides !== undefined &&

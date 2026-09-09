@@ -35,6 +35,12 @@ describe('OrcaTeamDispatchLeaseCoordinator', () => {
   async function trackedClient(options: Awaited<ReturnType<typeof createClientOptions>>): Promise<DbClient> {
     const client = await createWorkerDbClient(options);
     disposables.push(client);
+    await client.exec(`CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      list_preview TEXT,
+      list_preview_role TEXT
+    )`);
+    await client.exec("INSERT OR IGNORE INTO sessions (id, list_preview, list_preview_role) VALUES ('session-1', 'cached', 'user')");
     return client;
   }
 
@@ -125,6 +131,10 @@ describe('OrcaTeamDispatchLeaseCoordinator', () => {
     expect(terminalSettled).toBe(false);
 
     await release('confirmed-undispatched');
+
+    expect(await setup.queryOne(
+      "SELECT list_preview, list_preview_role FROM sessions WHERE id = 'session-1'",
+    )).toEqual({ list_preview: null, list_preview_role: null });
     await terminalWrite;
 
     expect(
